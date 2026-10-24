@@ -3,9 +3,14 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+
+from lyric_sync import find_executable
+from storyboard import assemble, load_storyboard
 
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -25,12 +30,12 @@ def choose_lyrics(files: list[Path]) -> Path | None:
     return named[0] if named else (text_files[0] if len(text_files) == 1 else None)
 
 
-def main() -> int:
-    root = Path(__file__).resolve().parent
+def main(root: Path | None = None) -> int:
+    root = root or Path(__file__).resolve().parent
     input_root = root / "input"
     finished = root / "finished"
     finished.mkdir(exist_ok=True)
-    song_folders = sorted(p for p in input_root.iterdir() if p.is_dir())
+    song_folders = sorted(p for p in input_root.iterdir() if p.is_dir()) if input_root.exists() else []
     if not song_folders:
         print(f"No song folders found in {input_root}")
         return 1
@@ -38,12 +43,25 @@ def main() -> int:
     failures = []
     processed = 0
     for folder in song_folders:
-        files = [p for p in folder.iterdir() if p.is_file()]
+        files = sorted(p for p in folder.iterdir() if p.is_file())
         candidates = [p for p in files if p.suffix.casefold() in MEDIA_EXTENSIONS and "with-lyrics" not in p.stem.casefold()]
         videos = [p for p in candidates if p.suffix.casefold() in VIDEO_EXTENSIONS]
         audio_files = [p for p in candidates if p.suffix.casefold() in AUDIO_EXTENSIONS]
         images = [p for p in files if p.suffix.casefold() in IMAGE_EXTENSIONS]
-        if videos:
+        config = folder / "storyboard.json"
+        board = None
+        if config.exists():
+            try:
+                board = load_storyboard(config)
+                if len(audio_files) != 1 or videos:
+                    raise ValueError("storyboard needs exactly one audio file and no video")
+            except (OSError, ValueError) as error:
+                print(f"FAIL {folder.name}: {error}")
+                failures.append(folder.name)
+                continue
+            media = [audio_files[0]]
+            replacement_audio = audio_files[0]
+        elif videos:
             media = videos
             replacement_audio = audio_files[0] if len(audio_files) == 1 else None
         elif images:
@@ -53,7 +71,7 @@ def main() -> int:
             media = audio_files
             replacement_audio = None
         lyrics = choose_lyrics(files)
-        image_without_audio = bool(images and not videos and len(audio_files) != 1)
+        image_without_audio = bool(not board and images and not videos and len(audio_files) != 1)
         if len(media) != 1 or lyrics is None or image_without_audio:
             print(f"SKIP {folder.name}: needs lyrics plus one video, one audio file, or one image paired with one audio file")
             failures.append(folder.name)
@@ -61,11 +79,17 @@ def main() -> int:
         output = finished / f"{folder.name}-with-lyrics.mp4"
         style_file = folder / "style.txt"
         dependencies = [media[0], lyrics] + ([replacement_audio] if replacement_audio else []) + ([style_file] if style_file.exists() else [])
-        if output.exists() and output.stat().st_mtime >= max(p.stat().st_mtime for p in dependencies):
+        title_file = folder / "title.txt"
+        dependencies += [title_file] if title_file.exists() else []
+        if board:
+            dependencies += [config] + [shot.image for shot in board.shots]
+        marker = output.with_suffix(".storyboard-cache.json")
+        signature = json.dumps([(str(p.resolve()), p.stat().st_mtime_ns, p.stat().st_size) for p in dependencies])
+        cache_valid = (marker.exists() and marker.read_text(encoding="utf-8") == signature) if board else not marker.exists()
+        if cache_valid and output.exists() and output.with_suffix(".srt").exists() and output.stat().st_mtime >= max(p.stat().st_mtime for p in dependencies):
             print(f"SKIP {folder.name}: output is already up to date")
             continue
         print(f"\nPROCESSING {folder.name}")
-        title_file = folder / "title.txt"
         title = title_file.read_text(encoding="utf-8-sig").strip() if title_file.exists() else ""
         if not title:
             title = media[0].stem
@@ -76,10 +100,27 @@ def main() -> int:
             equalizer_style = style_file.read_text(encoding="utf-8-sig").strip().casefold()
             if equalizer_style:
                 command += ["--equalizer-style", equalizer_style]
-        result = subprocess.run(command)
+        try:
+            marker.unlink(missing_ok=True)
+            if board:
+                with tempfile.TemporaryDirectory(prefix="batch-storyboard-") as temp_name:
+                    video = Path(temp_name) / "storyboard.mp4"
+                    tools = root / "tools"
+                    assemble(board, replacement_audio, video,
+                             find_executable("ffmpeg", tools), find_executable("ffprobe", tools))
+                    command[2] = str(video)
+                    result = subprocess.run(command)
+            else:
+                result = subprocess.run(command)
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            print(f"FAIL {folder.name}: {error}")
+            failures.append(folder.name)
+            continue
         if result.returncode:
             failures.append(folder.name)
         else:
+            if board:
+                marker.write_text(signature, encoding="utf-8")
             processed += 1
 
     print(f"\nFinished: {processed} song(s) processed; {len(failures)} failed or skipped due to missing files.")
